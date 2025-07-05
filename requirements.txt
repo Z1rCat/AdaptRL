@@ -1,0 +1,32 @@
+# Core RL and Data Science Libraries
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.4.2
+scipy==1.15.2
+stable_baselines3==2.5.0
+gymnasium==1.0.0
+torch==2.6.0
+
+# Hyperparameter Optimization
+optuna==4.3.0
+
+# Plotting and Visualization
+matplotlib==3.10.3
+seaborn==0.13.2
+
+# File I/O and Utilities
+openpyxl==3.1.5
+PyYAML==6.0.1
+cloudpickle==3.0.0
+
+# For Chinese font support in plots and console output
+Pillow==10.3.0
+colorama==0.4.6
+
+# Frontend Interface
+streamlit==1.36.0
+
+# Note: The following are often installed as dependencies but are critical.
+# It's good practice to list them for clarity.
+typing_extensions==4.14.0
+packaging==24.0

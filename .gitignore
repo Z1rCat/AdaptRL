@@ -1,0 +1,35 @@
+# 字节码和缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python 虚拟环境
+# 这是解决您当前问题的核心！
+srtp_env/
+venv/
+env/
+.venv
+
+# 日志、数据库和实验结果
+# 这些是您的程序运行时生成的，不应纳入版本控制
+logs/
+hpo_studies/
+*.db
+*.csv
+*.xlsx
+*.zip
+*.log
+
+# IDE/编辑器配置文件
+.vscode/
+.idea/
+.project
+.pydevproject
+.settings/
+
+# 备份或不再使用的代码
+旧版本代码/
+
+# 操作系统生成的文件
+.DS_Store
+Thumbs.db
