@@ -19,6 +19,10 @@ ALL_DISTRIBUTION_CONFIGS = [
     {"name": "拉普拉斯分布(窄,μ10,b1)", "dist_type": "laplace", "params": {"mu": 10.0, "b": 1.0}, "threshold_ratio": 0.75},
     {"name": "Beta分布(U形,0-20)", "dist_type": "beta", "params": {"alpha": 0.5, "beta": 0.5, "min_val": 0.0, "max_val": 20.0}, "threshold_ratio": 0.60},
     {"name": "Beta分布(偏左,0-20)", "dist_type": "beta", "params": {"alpha": 2, "beta": 5, "min_val": 0.0, "max_val": 20.0}, "threshold_ratio": 0.65},
+    # --- 新增分布，以提供更多样化的测试场景 ---
+    {"name": "伽马分布(宽峰,shape2,scale5)", "dist_type": "gamma", "params": {"shape": 2.0, "scale": 5.0}, "threshold_ratio": 0.75},
+    {"name": "拉普拉斯分布(宽,μ10,b4)", "dist_type": "laplace", "params": {"mu": 10.0, "b": 4.0}, "threshold_ratio": 0.65},
+    {"name": "泊松分布(低均值,λ5)", "dist_type": "poisson", "params": {"lam": 5}, "threshold_ratio": 0.80},
 ]
 TIMESTEPS_INITIAL_TRAIN = 60000
 TIMESTEPS_RETRAIN = 40000

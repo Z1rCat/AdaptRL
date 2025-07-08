@@ -3,7 +3,7 @@ import time
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Union, Dict, Any, Tuple, List
+from typing import Union, Dict, Any, Tuple, List, Optional
 import os
 
 from stable_baselines3.common.callbacks import BaseCallback
@@ -19,15 +19,22 @@ from utils import sanitize_filename
 
 
 class TrainingLoggerCallback(BaseCallback):
-    def __init__(self, verbose: int = 0, trial: optuna.Trial = None, eval_freq_pruning: int = 1000):
+    def __init__(self, verbose: int = 0, trial: Optional[optuna.Trial] = None, eval_freq_pruning: int = 1000):
         super().__init__(verbose)
         self.episode_data: List[Dict[str, Any]] = []
         self.trial = trial
         self.eval_freq_pruning = eval_freq_pruning
         self.next_eval_step = self.eval_freq_pruning
         self.optuna_report_step_counter = 0  # Use a separate counter for optuna reports
+        self.last_heartbeat_time = time.time()
 
     def _on_step(self) -> bool:
+        # HPO Keep-alive logging (Time-based)
+        current_time = time.time()
+        if self.trial and (current_time - self.last_heartbeat_time) > 15:
+            self.last_heartbeat_time = current_time
+            print(f"HPO Trial #{self.trial.number}: Training in progress... Timestep: {self.num_timesteps}/{self.model._total_timesteps}", flush=True)
+
         # Check for 'dones' in locals, which is typical for VecEnvs
         # For single envs, it might be 'done'
         dones = self.locals.get('dones', np.array([self.locals.get('done', False)]))
@@ -64,7 +71,7 @@ class TrainingLoggerCallback(BaseCallback):
                 ]
 
                 if recent_rewards:  # Only report if we have valid rewards
-                    intermediate_value = np.mean(recent_rewards)
+                    intermediate_value = float(np.mean(recent_rewards))
                     self.optuna_report_step_counter += 1  # Increment report step
                     self.trial.report(intermediate_value,
                                       self.optuna_report_step_counter)  # Use report_step_counter as step
@@ -84,11 +91,11 @@ def train_agent(
         algorithm: str,
         total_timesteps: int,
         policy: str = "MlpPolicy",
-        policy_kwargs: Dict = None,
-        hyperparams_override: Dict = None,  # This will contain 'finetune_learning_rate'
+        policy_kwargs: Optional[Dict[str, Any]] = None,
+        hyperparams_override: Optional[Dict[str, Any]] = None,  # This will contain 'finetune_learning_rate'
         sb3_verbose: int = 0,
         log_file_suffix: str = "training",
-        trial: optuna.Trial = None
+        trial: Optional[optuna.Trial] = None
 ) -> Tuple[Union[PPO, DQN, A2C, None], TrainingLoggerCallback, float]:
     # Start with default hyperparameters for the algorithm
     current_default_params = DEFAULT_HYPERPARAMS.get(algorithm.upper(), {}).copy()
@@ -200,7 +207,15 @@ def evaluate_agent(
     # Create a fresh environment instance for evaluation
     eval_env_instance = MultiDistributionEnv(dist_config=env_config, verbose_level=0)
 
+    last_heartbeat_time = time.time()
+
     for i_episode in range(episodes):
+        # Keep-alive heartbeat for long evaluations
+        current_time = time.time()
+        if (current_time - last_heartbeat_time) > 15:
+            last_heartbeat_time = current_time
+            print(f"Evaluation in progress... Episode {i_episode + 1}/{episodes}", flush=True)
+
         obs, _ = eval_env_instance.reset()  # Reset returns obs, info
         terminated = False
         truncated = False
@@ -208,7 +223,7 @@ def evaluate_agent(
 
         while not (terminated or truncated):
             action, _ = model.predict(obs, deterministic=deterministic)
-            obs, reward, terminated, truncated, info = eval_env_instance.step(action)
+            obs, reward, terminated, truncated, info = eval_env_instance.step(action.item())
 
             if terminated or truncated:  # Episode has ended
                 # Our custom environment MultiDistributionEnv puts stats in 'episode_stats' at the end of an episode

@@ -10,6 +10,7 @@ import os
 import traceback  # For detailed error logging
 import matplotlib.pyplot as plt
 import argparse # <-- 导入 argparse
+from typing import List, Dict, Any, Optional
 
 # 从我们创建的模块中导入必要的函数和类
 from config import (
@@ -29,61 +30,185 @@ from utils import (
 from environment import MultiDistributionEnv
 from training_utils import train_agent, evaluate_agent, TrainingLoggerCallback
 from plotting_utils import (
-    plot_evaluation_reward_curves,
-    plot_adaptation_performance_boxplots,
-    plot_overall_summary_barchart,
     plot_learning_curves_from_logs,
     plot_combined_learning_curve,
-    plot_complexity_vs_performance,
+    plot_complexity_vs_adaptation_performance, # <-- 新增：导入新的综合图
     plot_reward_distribution_over_training_stages,
     plot_adaptation_delta_rewards,
     plot_convergence_metrics_over_training,
     plot_aggregated_performance_radar,  # 确保这个是您修改后的新版雷达图函数
     plot_overall_summary_barchart_comparison,
-    plot_hpo_reward_distribution_panels  # 确保这个也从plotting_utils导入
+    plot_hpo_reward_distribution_panels,  # 确保这个也从plotting_utils导入
+    plot_adaptation_dumbbell,  # <-- 新增：导入哑铃图
+    plot_correlation_heatmap  # <-- 新增：导入热力图
 )
 from hpo_definitions import run_hpo_for_algorithm
 
 
-def define_plot_options(all_results):
+def _generate_plots_from_results(
+    all_runs_master_results: List[Dict[str, Any]],
+    run_results_dir: Path,
+    selected_plots_desc: List[Dict[str, Any]],
+    sorted_distributions: List[Dict[str, Any]],
+    plot_format: str = 'png'  # 新增：接收绘图格式
+):
+    """
+    根据实验结果和用户选择，生成所有图表。
+    这是一个内部辅助函数，用于降低主函数 `run_complete_experiment` 的复杂度。
+    """
+    print("\n--- 步骤4: 根据预选配置自动生成图表 ---")
+
+    results_df = pd.DataFrame(all_runs_master_results)
+    if results_df.empty:
+        print("警告: 结果为空，无法生成任何图表。")
+        return
+
+    has_hpo_results = 'hpo_params' in results_df['run_type'].unique()
+    has_default_results = 'default_params' in results_df['run_type'].unique()
+    can_run_hpo_comparison_plots = has_hpo_results and has_default_results
+
+    plot_options_map = {p['id']: p for p in define_plot_options()}
+    selected_plot_ids = {p['id'] for p in selected_plots_desc}
+    
+    # --- [调度逻辑重构] ---
+    # 不再依赖 define_plot_options 中的 args 定义，改为在下面显式调用
+
+    # --- 1. 按初始分布分组的图表 ---
+    grouped_plot_ids = {'dumbbell_plot', 'summary_bar', 'hpo_barchart', 
+                        'hpo_distrib_panels_final', 'hpo_distrib_panels_initial'}
+    grouped_to_run = selected_plot_ids.intersection(grouped_plot_ids)
+    if grouped_to_run:
+        print("\n>>> [1/3] 开始生成按初始分布分组的汇总图表...")
+        for dist_name in results_df['initial_training_dist_name'].unique():
+            if not isinstance(dist_name, str): continue
+            print(f"  -- 处理初始分布: {dist_name} --")
+            df_subset = results_df[results_df['initial_training_dist_name'] == dist_name]
+            list_subset = df_subset.to_dict('records') # type: ignore
+
+            for plot_id in sorted(list(grouped_to_run)):
+                # HPO图表的通用检查
+                is_hpo_plot = 'hpo' in plot_id
+                if is_hpo_plot and not can_run_hpo_comparison_plots:
+                    print(f"跳过 HPO 对比图 '{plot_options_map[plot_id]['name']}': 缺少数据。")
+                    continue
+                
+                try:
+                    # 统一使用关键字参数调用，以增强可读性和健壮性
+                    if plot_id == 'dumbbell_plot':
+                        plot_adaptation_dumbbell(plots_dir=run_results_dir, results_data=all_runs_master_results, initial_training_filter=dist_name, plot_format=plot_format) # type: ignore
+                    elif plot_id == 'hpo_barchart':
+                        plot_overall_summary_barchart_comparison(plots_dir=run_results_dir, results_data=list_subset, group_by_initial_dist=True, plot_format=plot_format) # type: ignore
+                    elif plot_id == 'hpo_distrib_panels_final':
+                        plot_hpo_reward_distribution_panels(plots_dir=run_results_dir, results_data=list_subset, plot_target='final_eval', plot_format=plot_format) # type: ignore
+                    elif plot_id == 'hpo_distrib_panels_initial':
+                        plot_hpo_reward_distribution_panels(plots_dir=run_results_dir, results_data=list_subset, plot_target='initial_eval', plot_format=plot_format) # type: ignore
+                except Exception as e:
+                    print(f"错误: 为 {dist_name} 生成图表 '{plot_id}' 失败: {e}\n{traceback.format_exc()}")
+        print("<<< 完成分组汇总图表生成。")
+
+    # --- 2. 每个独立运行的详细图表 (学习曲线等) ---
+    loop_plot_ids = {'learning_curves', 'reward_stages', 'combined_curves', 'convergence_dynamics'}
+    loop_to_run = selected_plot_ids.intersection(loop_plot_ids)
+    if loop_to_run:
+        print("\n>>> [2/3] 开始生成每个独立运行的详细图表...")
+        for _, res_item in results_df.iterrows():
+            # 变量提取和检查
+            initial_dist_name = res_item.get('initial_training_dist_name')
+            s_run_type = res_item.get('run_type')
+            s_algo = res_item.get('algorithm')
+            if not all(isinstance(v, str) for v in [initial_dist_name, s_run_type, s_algo]): continue
+            
+            # 修复：添加断言以帮助linter推断类型，消除警告
+            assert isinstance(initial_dist_name, str)
+            assert isinstance(s_run_type, str)
+            assert isinstance(s_algo, str)
+
+            clean_initial_dist_name = sanitize_filename(initial_dist_name)
+            plot_target_dir = run_results_dir / clean_initial_dist_name
+            plot_target_dir.mkdir(parents=True, exist_ok=True)
+            
+            initial_dist_cfg = next((d for d in sorted_distributions if d['name'] == initial_dist_name), None)
+            initial_complexity = initial_dist_cfg.get('complexity', -1.0) if initial_dist_cfg else -1.0
+            
+            # 初始训练相关图表
+            initial_log_path_str = res_item.get("initial_training_log")
+            if initial_log_path_str and initial_log_path_str != "N/A" and Path(initial_log_path_str).exists():
+                initial_log_path = Path(initial_log_path_str)
+                title_init_base = f"{s_run_type} - {s_algo} - 初始训练 ({initial_dist_name})"
+                suffix_init = f"{s_run_type}_{s_algo}_{clean_initial_dist_name}_initial"
+                
+                # 修复：所有调用均使用关键字参数
+                if 'learning_curves' in loop_to_run:
+                    plot_learning_curves_from_logs(plots_dir=plot_target_dir, log_file_path=initial_log_path, title=title_init_base, suffix=suffix_init, complexity=initial_complexity, plot_format=plot_format) # type: ignore
+                if 'reward_stages' in loop_to_run:
+                    plot_reward_distribution_over_training_stages(plots_dir=plot_target_dir, log_file_path=initial_log_path, title_prefix=title_init_base, suffix=f"{suffix_init}_stages", complexity=initial_complexity, plot_format=plot_format) # type: ignore
+                if 'convergence_dynamics' in loop_to_run:
+                    plot_convergence_metrics_over_training(plots_dir=plot_target_dir, log_file_path=initial_log_path, title_prefix=title_init_base, suffix=f"{suffix_init}_conv", complexity=initial_complexity, plot_format=plot_format) # type: ignore
+
+            # 组合图表
+            if 'combined_curves' in loop_to_run and res_item.get("scenario_type") == "adaptation":
+                adapt_log_path_str = res_item.get("adaptation_log")
+                if initial_log_path_str and initial_log_path_str != "N/A" and adapt_log_path_str and adapt_log_path_str != "N/A" and Path(initial_log_path_str).exists() and Path(adapt_log_path_str).exists():
+                    target_scenario_name = res_item.get('scenario_name', 'N/A')
+                    # 修复：添加断言以帮助linter推断类型
+                    assert isinstance(target_scenario_name, str)
+                    target_dist_cfg = next((d for d in sorted_distributions if d['name'] == target_scenario_name), None)
+                    target_complexity = target_dist_cfg.get('complexity', -1.0) if target_dist_cfg else -1.0
+                    plot_combined_learning_curve( # type: ignore
+                        plots_dir=plot_target_dir, initial_log_path=Path(initial_log_path_str), adaptation_log_path=Path(adapt_log_path_str),
+                        algorithm_name=f"{s_run_type} - {s_algo}", initial_dist_label=initial_dist_name,
+                        scenario_name_label=target_scenario_name, adapt_type=res_item.get('adapt_type', 'N/A'),
+                        combined_suffix=f"{s_run_type}_{s_algo}_{clean_initial_dist_name}_to_{sanitize_filename(target_scenario_name)}_comb",
+                        initial_complexity=initial_complexity, adapt_complexity=target_complexity,
+                        plot_format=plot_format
+                    )
+        print("<<< 完成生成独立运行的详细图表。")
+
+    # --- 3. 剩余的全局图表 ---
+    global_plot_ids = selected_plot_ids - grouped_to_run - loop_to_run
+    if global_plot_ids:
+        print("\n>>> [3/3] 开始生成全局和汇总类图表...")
+        for plot_id in sorted(list(global_plot_ids)):
+            try:
+                if plot_id == 'hpo_profile_radar':
+                    if can_run_hpo_comparison_plots:
+                        plot_aggregated_performance_radar(plots_dir=run_results_dir, results_data=all_runs_master_results, plot_format=plot_format) # type: ignore
+                elif plot_id == 'complexity_synthesis': # <-- 修改：使用新的ID
+                    # 调用新的综合图表函数，一次用于奖励，一次用于正确率
+                    plot_complexity_vs_adaptation_performance(plots_dir=run_results_dir, results_data=all_runs_master_results, performance_metric='avg_reward', plot_format=plot_format) # type: ignore
+                    plot_complexity_vs_adaptation_performance(plots_dir=run_results_dir, results_data=all_runs_master_results, performance_metric='avg_correct_rate', plot_format=plot_format) # type: ignore
+                elif plot_id == 'correlation_heatmap':
+                    plot_correlation_heatmap(plots_dir=run_results_dir, results_data=all_runs_master_results, plot_format=plot_format) # type: ignore
+            except Exception as e_plot:
+                plot_name_in_error = plot_options_map.get(plot_id, {}).get('name', plot_id)
+                print(f"\n!!!!!! 严重警告: 生成图表 '{plot_name_in_error}' 时发生无法处理的错误 !!!!!!\n{e_plot}\n{traceback.format_exc()}")
+        print("<<< 完成生成全局和汇总类图表。")
+    
+    print("\n所有预选图表生成完毕。")
+
+
+def define_plot_options(all_results: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
     """
     定义所有可用的绘图选项。
-    这是一个辅助函数，用于在实验开始前和结束后都能获取绘图列表。
+    此函数现在返回一个不带参数定义的静态列表。
     """
+    # all_results 参数不再需要，但保留以防万一
     plot_options = [
-        {"id": "eval_curves", "name": "评估奖励曲线 (适应场景, 按初始分布分组)",
-         "func": plot_evaluation_reward_curves, "args": [all_results, PLOTS_DIR]},
-        {"id": "boxplots", "name": "自适应性能箱线图 (适应场景, 按初始分布分组)",
-         "func": plot_adaptation_performance_boxplots, "args": [all_results, PLOTS_DIR]},
-        {"id": "summary_bar", "name": "总体奖励柱状图 (主要运行, 按初始分布分组)",
-         "func": plot_overall_summary_barchart, "args": [all_results, PLOTS_DIR]},
+        # 分组循环
+        {"id": "dumbbell_plot", "name": "适应性表现哑铃图 (按初始分布分组)"},
+        {"id": "hpo_barchart", "name": "HPO对比总体摘要柱状图 (按初始分布分组)"},
+        {"id": "hpo_distrib_panels_final", "name": "HPO参数奖励分布对比 (最终评估, 多面板)"},
+        {"id": "hpo_distrib_panels_initial", "name": "HPO参数奖励分布对比 (适应前评估, 多面板)"},
+        # 独立运行循环
         {"id": "learning_curves", "name": "详细学习曲线 (各训练阶段)", "type": "loop"},
         {"id": "reward_stages", "name": "训练阶段奖励分布 (各训练阶段)", "type": "loop"},
         {"id": "combined_curves", "name": "组合学习曲线 (初始+适应)", "type": "loop"},
-        {"id": "complexity_perf", "name": "复杂度 vs 性能散点图 (多种类型)", "type": "multi_call"},
-        {"id": "delta_rewards", "name": "自适应奖励变化量柱状图 (可按初始分布过滤)", "type": "multi_call_filter"},
         {"id": "convergence_dynamics", "name": "训练收敛性指标动态图 (各训练阶段)", "type": "loop"},
+        # 全局
+        {"id": "hpo_profile_radar", "name": "高级HPO性能对比雷达图 (6维度剖析, 按算法聚合)"},
+        {"id": "complexity_synthesis", "name": "复杂度 vs. 适应性表现综合图 (新)"},
+        {"id": "correlation_heatmap", "name": "性能指标相关性热力图 (全局探索性)"},
     ]
-
-    hpo_runs_exist = any(r.get('run_type') == 'hpo_params' for r in all_results) if all_results else True
-    default_runs_exist = any(r.get('run_type') == 'default_params' for r in all_results) if all_results else True
-
-    # 仅当可能进行HPO对比时，才显示这些选项
-    if hpo_runs_exist and default_runs_exist:
-        plot_options.extend([
-            # 这是您新添加的高级雷达图
-            {"id": "hpo_profile_radar", "name": "高级HPO性能对比雷达图 (6维度剖析, 按算法聚合)",
-             "func": plot_aggregated_performance_radar, "args": [all_results, PLOTS_DIR, 'algorithm']},
-            {"id": "hpo_barchart", "name": "HPO对比总体摘要柱状图 (按初始分布分组)",
-             "func": plot_overall_summary_barchart_comparison, "args": [all_results, PLOTS_DIR, True]},
-            {"id": "hpo_distrib_panels_final", "name": "HPO参数奖励分布对比 (最终评估, 多面板)",
-             "func": plot_hpo_reward_distribution_panels, "args": [all_results, PLOTS_DIR, 'final_eval']},
-        ])
-        if any(r.get('scenario_type') == 'adaptation' for r in all_results) if all_results else True:
-            plot_options.append(
-                {"id": "hpo_distrib_panels_initial", "name": "HPO参数奖励分布对比 (适应前评估, 多面板)",
-                 "func": plot_hpo_reward_distribution_panels, "args": [all_results, PLOTS_DIR, 'initial_eval']}
-            )
     return plot_options
 
 
@@ -99,6 +224,7 @@ def run_complete_experiment():
     parser.add_argument("--target-dists", nargs='+', help="目标适应场景列表")
     parser.add_argument("--run-hpo", action="store_true", help="运行HPO对比")
     parser.add_argument("--plots", nargs='+', help="要生成的图表ID列表")
+    parser.add_argument("--plot-format", type=str, choices=['png', 'svg'], default='png', help="选择图表输出格式 (png 或 svg)")
     args = parser.parse_args()
     
     # --- 0. 初始化环境和日志 ---
@@ -117,7 +243,7 @@ def run_complete_experiment():
         sys.stdout = tee_output_redirect
         sys.stderr = tee_output_redirect
 
-        set_chinese_font_for_matplotlib()
+        # set_chinese_font_for_matplotlib() # <-- 已废弃，新的字体管理在 plotting_utils.py 中实现
         print(f"主运行日志将保存至: {main_run_log_file_path}")
         print("--- 强化学习适应性实验 (全自动流程) ---")
 
@@ -146,6 +272,7 @@ def run_complete_experiment():
         selected_target_scenarios_list = []
         run_hpo_comparison = False
         selected_plots_ids = []
+        selected_plot_format = 'png' # 新增：默认值
 
         if args.non_interactive:
             print("\n" + "=" * 25 + " 步骤1: 从命令行参数加载配置 " + "=" * 25)
@@ -166,6 +293,9 @@ def run_complete_experiment():
             plot_id_map = {p['id']: p for p in all_possible_plots}
             selected_plots_desc = [plot_id_map[p_id] for p_id in args.plots if p_id in plot_id_map]
             
+            # 新增：从命令行参数获取绘图格式
+            selected_plot_format = args.plot_format
+
             # 检查是否有无效的输入
             if len(selected_algo_list) != len(args.algos):
                 print(f"警告: 无效的算法名称被忽略: {set(args.algos) - set(ALL_AVAILABLE_ALGORITHMS)}")
@@ -211,6 +341,14 @@ def run_complete_experiment():
                 display_func=lambda item: item['name'], allow_multiple=True
             )
 
+            # --- 新增：选择图表格式 ---
+            plot_format_choice = input("\n请选择图表输出格式 (1: png (默认), 2: svg): ").strip()
+            if plot_format_choice == '2':
+                selected_plot_format = 'svg'
+            else:
+                selected_plot_format = 'png'
+            print(f"已选择图表格式: {selected_plot_format}")
+
         print("\n" + "=" * 25 + " 配置完成，实验将全自动运行 " + "=" * 25)
         print(f"\n--- 选定配置概览 ---")
         print(f"  算法: {', '.join(selected_algo_list)}")
@@ -225,6 +363,7 @@ def run_complete_experiment():
             print("  将仅使用默认参数运行。")
         if selected_plots_desc:
             print(f"  将生成图表: {', '.join([p['name'] for p in selected_plots_desc])}")
+            print(f"  图表格式: {selected_plot_format.upper()}") # 新增：显示所选格式
         else:
             print("  将不生成任何图表。")
         print("=" * 70 + "\n")
@@ -514,128 +653,14 @@ def run_complete_experiment():
             print(f"\nFINAL_RESULTS_DIR:{run_results_dir.resolve()}")
             return
 
-        print("\n--- 步骤4: 根据预选配置自动生成图表 ---")
-
-        # --------------------------------------------------------------------
-        # --- 最终修复：重构绘图逻辑，确保执行路径清晰 ---
-        # --------------------------------------------------------------------
-        results_df = pd.DataFrame(all_runs_master_results)
-        
-        # 1. 准备一个包含最新结果的绘图选项查找表
-        plot_options_to_run = define_plot_options(all_runs_master_results)
-        plot_options_map = {p['id']: p for p in plot_options_to_run}
-        
-        # 2. 准备一个已绘制的、针对每个初始训练只画一次的图表的集合
-        plotted_initial_training_graphs = set()
-
-        # 3. 直接遍历用户在UI上选择的图表ID列表
-        selected_plot_ids = [p['id'] for p in selected_plots_desc]
-
-        for plot_id in selected_plot_ids:
-            plot_desc = plot_options_map.get(plot_id)
-            if not plot_desc:
-                print(f"警告: 在绘图阶段，无法找到预选图表ID '{plot_id}' 的执行定义，跳过。")
-                continue
-
-            print(f"\n>>> 开始生成图表: {plot_desc.get('name', '未知图表')}")
-            
-            try:
-                plot_type = plot_desc.get("type")
-                plot_func = plot_desc.get("func")
-
-                # A. 处理全局图表 (直接调用)
-                if plot_type is None and callable(plot_func):
-                     # 将args中的 PLOTS_DIR 替换为本次运行的专属目录
-                    new_args = [arg if arg is not PLOTS_DIR else run_results_dir for arg in plot_desc.get("args", [])]
-                    plot_func(*new_args)
-
-                # B. 处理需要循环所有结果的图表
-                elif plot_type == "loop":
-                    for index, res_item in results_df.iterrows():
-                        # --- 提取和验证循环内变量 ---
-                        initial_dist_name = res_item.get('initial_training_dist_name')
-                        if not isinstance(initial_dist_name, str): continue
-                        
-                        s_run_type = res_item.get('run_type')
-                        if not isinstance(s_run_type, str): continue
-                        
-                        s_algo = res_item.get('algorithm')
-                        if not isinstance(s_algo, str): continue
-                        
-                        # 为每个初始分布创建子目录
-                        plot_target_dir = run_results_dir / sanitize_filename(initial_dist_name)
-                        plot_target_dir.mkdir(parents=True, exist_ok=True)
-                        
-                        initial_dist_cfg = next((d for d in sorted_distributions if d['name'] == initial_dist_name), {})
-                        initial_complexity = initial_dist_cfg.get('complexity', -1.0)
-                        
-                        # --- 绘制与 "初始训练" 相关的、只应画一次的图 ---
-                        initial_log_path = res_item.get("initial_training_log")
-                        initial_log = Path(initial_log_path) if isinstance(initial_log_path, str) and initial_log_path != "N/A" else None
-                        
-                        initial_graph_key = (s_run_type, s_algo, initial_dist_name)
-                        if initial_log and initial_log.exists() and initial_graph_key not in plotted_initial_training_graphs:
-                            title_init_base = f"{s_run_type} - {s_algo} - 初始训练 ({initial_dist_name})"
-                            suffix_init = f"{s_run_type}_{sanitize_filename(s_algo)}_{sanitize_filename(initial_dist_name)}_initial"
-                            
-                            if plot_id == "learning_curves":
-                                plot_learning_curves_from_logs(initial_log, title_init_base, plot_target_dir, suffix_init, initial_complexity)
-                            elif plot_id == "reward_stages":
-                                plot_reward_distribution_over_training_stages(initial_log, title_init_base, plot_target_dir, f"{suffix_init}_stages", initial_complexity)
-                            elif plot_id == "convergence_dynamics":
-                                plot_convergence_metrics_over_training(initial_log, title_init_base, plot_target_dir, f"{suffix_init}_conv", initial_complexity)
-                            
-                            plotted_initial_training_graphs.add(initial_graph_key)
-                        
-                        # --- 绘制与 "适应阶段" 相关的图 ---
-                        if res_item.get("scenario_type") == "adaptation":
-                            target_scenario_name = res_item.get('scenario_name')
-                            if not isinstance(target_scenario_name, str): continue
-                            
-                            adapt_type = res_item.get('adapt_type')
-                            if not isinstance(adapt_type, str): continue
-
-                            adapt_log_path = res_item.get("adaptation_log")
-                            adapt_log = Path(adapt_log_path) if isinstance(adapt_log_path, str) and adapt_log_path != "N/A" else None
-
-                            if plot_id == "combined_curves" and initial_log and initial_log.exists() and adapt_log and adapt_log.exists():
-                                target_dist_cfg = next((d for d in sorted_distributions if d['name'] == target_scenario_name), {})
-                                target_complexity = target_dist_cfg.get('complexity', -1.0)
-                                plot_combined_learning_curve(
-                                    initial_log, adapt_log, f"{s_run_type} - {s_algo}", initial_dist_name, 
-                                    target_scenario_name, adapt_type, plot_target_dir, 
-                                    f"{s_run_type}_{sanitize_filename(s_algo)}_{sanitize_filename(initial_dist_name)}_to_{sanitize_filename(target_scenario_name)}_comb",
-                                    initial_complexity, target_complexity
-                                )
-                
-                # C. 处理具有特殊调用逻辑的图表 (如复杂度vs性能)
-                elif plot_type == "multi_call":
-                    if plot_id == "complexity_perf":
-                        plot_complexity_vs_performance(all_runs_master_results, run_results_dir, 'avg_reward', 'baseline')
-                        plot_complexity_vs_performance(all_runs_master_results, run_results_dir, 'avg_reward', 'adaptation_initial')
-                        plot_complexity_vs_performance(all_runs_master_results, run_results_dir, 'avg_reward', 'adaptation_final')
-                        plot_complexity_vs_performance(all_runs_master_results, run_results_dir, 'avg_correct_rate', 'adaptation_final')
-                
-                # D. 处理需要按初始分布过滤的特殊图表
-                elif plot_type == "multi_call_filter":
-                    if plot_id == "delta_rewards":
-                        unique_initial_dist_names = results_df['initial_training_dist_name'].unique()
-                        plot_adaptation_delta_rewards(all_runs_master_results, run_results_dir) # 全局图
-                        for init_dist_name_filter in unique_initial_dist_names:
-                             if isinstance(init_dist_name_filter, str):
-                                plot_adaptation_delta_rewards(all_runs_master_results, run_results_dir, init_dist_name_filter) # 过滤后的图
-
-                print(f"<<< 完成生成图表: {plot_desc.get('name', '未知图表')}")
-
-            except Exception as e_plot:
-                print(f"!!! 生成图表 '{plot_desc.get('name', plot_id)}' 时发生严重错误: {e_plot}")
-                traceback.print_exc() # 打印详细的错误追溯信息
-        
-        # --------------------------------------------------------------------
-        # --- 新绘图逻辑结束 ---
-        # --------------------------------------------------------------------
-        
-        print("\n所有预选图表生成完毕。")
+        # 调用新的、独立的绘图函数
+        _generate_plots_from_results(
+            all_runs_master_results,
+            run_results_dir,
+            selected_plots_desc,
+            sorted_distributions,
+            selected_plot_format # 新增：传递格式
+        )
         
         # --- 5. 打印最终结果目录路径，供 app.py 捕获 ---
         print(f"\nFINAL_RESULTS_DIR:{run_results_dir.resolve()}")
